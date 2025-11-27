@@ -319,86 +319,221 @@ inline auto is_conflict_key(std::string_view field_name) {
 }
 
 template <typename T, typename... Args>
-inline std::string generate_insert_sql(bool insert, Args &&...args) {
+inline std::string generate_insert_sql(bool insert, Args &&...args)
+{
 #ifdef ORMPP_ENABLE_PG
-  if (!insert) {
+    if (!insert)
+    {
+        constexpr auto Count = ylt::reflection::members_count_v<T>;
+        std::string sql = "insert into ";
+        auto name = get_struct_name<T>();
+        append(sql, name.data());
+        int index = 0;
+        std::string set;
+        std::string fields = "(";
+        std::string values = "values(";
+        for (auto i = 0; i < Count; ++i)
+        {
+            std::string field_name = ylt::reflection::name_of<T>(i).data();
+            std::string value = "$" + std::to_string(++index);
+            append(set, field_name, "=", value);
+            fields += field_name;
+            values += value;
+            if (i < Count - 1)
+            {
+                fields += ",";
+                values += ",";
+                set += ",";
+            }
+            else
+            {
+                fields += ")";
+                values += ")";
+                set += ";";
+            }
+        }
+        std::string conflict = "on conflict(";
+        if constexpr (sizeof...(Args) > 0)
+        {
+            append(conflict, args...);
+        }
+        else
+        {
+            conflict += get_conflict_key<T>();
+        }
+        conflict += ")";
+        append(sql, fields, values, conflict, "do update set", set);
+        return sql;
+    }
+#endif
+
+#ifdef ORMPP_ENABLE_MYSQL
+    static const std::set<std::string> fields_to_skip = {
+        "met_time",
+        "insert_time"
+    };
+#endif
+
+    std::string sql = insert ? "insert into " : "replace into ";
     constexpr auto Count = ylt::reflection::members_count_v<T>;
-    std::string sql = "insert into ";
     auto name = get_struct_name<T>();
-    append(sql, name);
-    int index = 0;
-    std::string set;
-    std::string fields = "(";
-    std::string values = "values(";
-    for (auto i = 0; i < Count; ++i) {
-      std::string field_name(ylt::reflection::name_of<T>(i));
-      std::string value = "$" + std::to_string(++index);
-      append(set, field_name, "=", value);
-      fields += field_name;
-      values += value;
-      if (i < Count - 1) {
-        fields += ",";
-        values += ",";
-        set += ",";
-      }
-      else {
+    append(sql, name.data());
+
+#ifdef ORMPP_ENABLE_MYSQL
+    // 如果是insert模式，则添加 ON DUPLICATE KEY UPDATE 支持
+    if (insert)
+    {
+        std::string fields = "(";
+        std::string values = "values(";
+        std::string update_clause = " on duplicate key update ";
+
+        bool first_field = true;
+        bool first_update_field = true;
+        bool is_inc_update_field = false;
+
+        for (size_t i = 0; i < Count; ++i)
+        {
+            std::string field_name = ylt::reflection::name_of<T>(i).data();
+
+            if (!first_field)
+            {
+                fields += ",";
+                values += ",";
+            }
+
+            fields += "`" + field_name + "`";
+
+#ifdef ORMPP_ENABLE_PG
+            static int pg_index = 0;
+            values += "$" + std::to_string(++pg_index);
+#else
+            values += "?";
+#endif
+
+            if (!is_inc_update_field)
+            {
+                if (field_name == "update_time")
+                {
+                    is_inc_update_field = true;
+                }
+            }
+
+            first_field = false;
+
+            // 跳过不需要更新的字段
+            if (is_conflict_key<T>(field_name) || fields_to_skip.count(field_name) > 0)
+            {
+                continue;
+            }
+
+            if (!first_update_field)
+            {
+                update_clause += ",";
+            }
+            update_clause += "`" + field_name + "`=VALUES(`" + field_name + "`)";
+            first_update_field = false;
+        }
+
         fields += ")";
         values += ")";
-        set += ";";
-      }
-    }
-    std::string conflict = "on conflict(";
-    if constexpr (sizeof...(Args) > 0) {
-      append(conflict, args...);
-    }
-    else {
-      conflict += get_conflict_key<T>();
-    }
-    conflict += ")";
-    append(sql, fields, values, conflict, "do update set", set);
-    return sql;
-  }
-#endif
-  std::string sql = insert ? "insert into " : "replace into ";
-  constexpr auto Count = ylt::reflection::members_count_v<T>;
-  auto name = get_struct_name<T>();
-  append(sql, name);
 
-  int index = 0;
-  std::string fields = "(";
-  std::string values = "values(";
-  for (size_t i = 0; i < Count; ++i) {
-    std::string field_name(ylt::reflection::name_of<T>(i));
-    if (insert && is_auto_key<T>(field_name)) {
-      continue;
+        if (is_inc_update_field)
+        {
+            // 确保前面有内容时才加逗号
+            if (!first_update_field)
+            {
+                update_clause += ",";
+            }
+            update_clause += "update_time=now()";
+        }
+
+        append(sql, fields, values, update_clause);
     }
+    else
+    {
+        // 原有的简单 INSERT 实现
+        int index = 0;
+        std::string fields = "(";
+        std::string values = "values(";
+        for (size_t i = 0; i < Count; ++i)
+        {
+            std::string field_name = ylt::reflection::name_of<T>(i).data();
+            if (is_auto_key<T>(field_name))
+            {
+                continue;
+            }
 #ifdef ORMPP_ENABLE_PG
-    values += "$" + std::to_string(++index);
+            values += "$" + std::to_string(++index);
 #else
-    values += "?";
+            values += "?";
+#endif
+            fields += "`" + field_name + "`";
+            if (i < Count - 1)
+            {
+                fields += ",";
+                values += ",";
+            }
+            else
+            {
+                fields += ")";
+                values += ")";
+            }
+        }
+        if (fields.back() != ')')
+        {
+            fields.back() = ')';
+        }
+        if (values.back() != ')')
+        {
+            values.back() = ')';
+        }
+        append(sql, fields, values);
+    }
+#else
+    // 非MySQL环境保持原有逻辑
+    int index = 0;
+    std::string fields = "(";
+    std::string values = "values(";
+    for (size_t i = 0; i < Count; ++i)
+    {
+        std::string field_name = ylt::reflection::name_of<T>(i).data();
+        if (insert && is_auto_key<T>(field_name))
+        {
+            continue;
+        }
+#ifdef ORMPP_ENABLE_PG
+        values += "$" + std::to_string(++index);
+#else
+        values += "?";
 #endif
 #ifdef ORMPP_ENABLE_MYSQL
-    fields += "`" + field_name + "`";
+        fields += "`" + field_name + "`";
 #else
-    fields += field_name;
+        fields += field_name;
 #endif
-    if (i < Count - 1) {
-      fields += ",";
-      values += ",";
+        if (i < Count - 1)
+        {
+            fields += ",";
+            values += ",";
+        }
+        else
+        {
+            fields += ")";
+            values += ")";
+        }
     }
-    else {
-      fields += ")";
-      values += ")";
+    if (fields.back() != ')')
+    {
+        fields.back() = ')';
     }
-  }
-  if (fields.back() != ')') {
-    fields.back() = ')';
-  }
-  if (values.back() != ')') {
-    values.back() = ')';
-  }
-  append(sql, fields, values);
-  return sql;
+    if (values.back() != ')')
+    {
+        values.back() = ')';
+    }
+    append(sql, fields, values);
+#endif
+
+    return sql;
 }
 
 template <typename T, auto... members, typename... Args>
