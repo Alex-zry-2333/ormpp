@@ -30,9 +30,24 @@ https://github.com/qicosmos/iguana.git
 
 * [ormpp的目标](#ormpp的目标)
 * [ormpp的特点](#ormpp的特点)
+* [自增主键](#自增主键)
+* [冲突主键](#冲突主键)
 * [快速示例](#快速示例)
+  * [链式调用](#链式调用)
+  * [新增链式调用接口](#新增了4个链式调用接口)
+  * [范围分区链式调用](#范围分区链式调用接口)
 * [如何编译](#如何编译)
+* [作为第三方库引入](#作为第三方库引入)
 * [接口介绍](#接口介绍)
+* [高级特性](#高级特性)
+  * [可空字段](#可空字段-stdoptional)
+  * [枚举类型映射](#枚举类型映射)
+  * [字段别名与表别名](#字段别名与表别名)
+  * [反射注册](#反射注册-ylt_refl)
+  * [类型映射表](#类型映射表)
+* [连接池](#连接池)
+* [异步 MySQL](#异步-mysql)
+* [线程安全](#线程安全)
 * [roadmap](#roadmap)
 * [联系方式](#联系方式)
 
@@ -40,16 +55,19 @@ https://github.com/qicosmos/iguana.git
 ormpp最重要的目标就是让c++中的数据库编程变得简单，为用户提供统一的接口，支持多种数据库，降低用户使用数据库的难度。
 
 ## ormpp的特点
-ormpp是modern c++(c++11/14/17)开发的ORM库，目前支持了三种数据库：mysql, postgresql和sqlite，ormpp主要有以下几个特点：
+ormpp是modern c++(c++11/14/17/20)开发的ORM库，目前支持了三种数据库：mysql, postgresql和sqlite，ormpp主要有以下几个特点：
 
-1. header only
-1. cross platform
-1. unified interface
-1. easy to use
-1. easy to change database
-2. 支持安全的链式调用
-
-你通过ormpp可以很容易地实现数据库的各种操作了，大部情况下甚至都不需要写sql语句。ormpp是基于编译期反射的，会帮你实现自动化的实体映射，你再也不用写对象到数据表相互赋值的繁琐易出错的代码了，更酷的是你可以很方便地切换数据库，如果需要从mysql切换到postgresql或sqlite只需要修改一下数据库类型就可以了，无需修改其他代码。
+1. **header only** — 无需编译，直接包含头文件即可使用
+2. **cross platform** — 支持 Linux、macOS、Windows
+3. **unified interface** — 统一的 API，切换数据库只需改模板参数
+4. **easy to use** — 基于编译期反射，自动完成对象到数据表的映射
+5. **easy to change database** — 从 MySQL 切换到 PostgreSQL/SQLite 只需修改数据库类型
+6. **安全的链式调用** — 类型安全的 SQL 构建器，编译期检查字段类型
+7. **连接池** — 内置数据库连接池，支持自动回收和健康检查
+8. **异步 MySQL** — 支持基于 ASIO/async_simple 的异步非阻塞查询
+9. **AOP 切面** — 支持日志、校验等切面编程，通过 `warper_connect` 接入
+10. **SQLCipher 加密** — SQLite 支持 SQLCipher 加密存储
+11. **零开销抽象** — 编译期生成 SQL，运行时无反射开销
 
 ## 自增主键
 
@@ -217,12 +235,12 @@ struct person {
   std::optional<int> age; // 可以插入null值
   std::string name;
   int id;
-  static constexpr auto get_alias_field_names(alias *) {
-    return std::array{ylt::reflection::field_alias_t{"person_id", 0},
+  static constexpr auto get_alias_field_names(person *) {
+    return std::array{ylt::reflection::field_alias_t{"person_age", 0},
                       ylt::reflection::field_alias_t{"person_name", 1},
-                      ylt::reflection::field_alias_t{"person_age", 2}}; // 注意: 这里需与YLT_REFL的注册顺序一致
+                      ylt::reflection::field_alias_t{"person_id", 2}}; // 注意: 这里需与YLT_REFL的注册顺序一致
   }
-  static constexpr std::string_view get_alias_struct_name(student *) {
+  static constexpr std::string_view get_alias_struct_name(person *) {
     return "CUSTOM_TABLE_NAME"; // 表名默认结构体名字(person), 这里可以修改表名
   }
 };
@@ -606,7 +624,7 @@ struct person {
   int id;
   std::string name;
   std::optional<int> age; // 插入null值
-  static constexpr std::string_view get_alias_struct_name(student *) {
+  static constexpr std::string_view get_alias_struct_name(person *) {
     return "CUSTOM_TABLE_NAME";
   }
 };
@@ -799,7 +817,82 @@ TEST_CHECK(sqlite.update(v1)==3);
 
 返回值：int，成功返回更新数据的条数N，失败返回INT_MIN.
 
-8. 删除数据
+8. 替换数据（INSERT OR REPLACE / UPSERT）
+
+```C++
+template <typename T, typename... Args>
+int replace(const T &t, Args &&...args);
+
+template <typename T, typename... Args>
+int replace(const std::vector<T> &v, Args &&...args);
+```
+
+replace example:
+
+```C++
+person p = {1, "test1", 2};
+TEST_CHECK(mysql.replace(p)==1);
+TEST_CHECK(postgres.replace(p)==1);
+TEST_CHECK(sqlite.replace(p)==1);
+
+// 批量替换
+std::vector<person> v{p1, p2};
+TEST_CHECK(mysql.replace(v)==2);
+```
+
+注意：`replace` 的行为在不同数据库间有差异：
+- **MySQL / SQLite**：使用 `REPLACE INTO` — 先删除旧记录，再插入新记录
+- **PostgreSQL**：使用 `INSERT ... ON CONFLICT ... DO UPDATE` — 遇到冲突时更新原有记录，不会删除
+
+因此，PostgreSQL 下的 `replace` 不会触发删除相关的触发器，自增 ID 也不会重置。建议根据业务场景选择合适的数据库。
+
+返回值：int，成功返回替换数据的条数，失败返回INT_MIN.
+
+9. 更新指定字段
+
+```C++
+template <auto... members, typename T, typename... Args>
+int update_some(const T &t, Args &&...args);
+
+template <auto... members, typename T, typename... Args>
+int update_some(const std::vector<T> &v, Args &&...args);
+```
+
+update_some example:
+
+```C++
+person p = {1, "new_name", 25};
+// 只更新 name 和 age 字段，不碰其他字段
+TEST_CHECK(mysql.update_some<&person::name, &person::age>(p)==1);
+TEST_CHECK(postgres.update_some<&person::name, &person::age>(p)==1);
+TEST_CHECK(sqlite.update_some<&person::name, &person::age>(p)==1);
+```
+
+注意：`update_some` 只会更新指定的成员字段，适合部分字段更新的场景，避免不必要的数据传输。
+
+返回值：int，成功返回更新数据的条数，失败返回INT_MIN.
+
+10. 获取插入后的自增ID
+
+```C++
+template <typename T, typename... Args>
+uint64_t get_insert_id_after_insert(const T &t, Args &&...args);
+```
+
+get_insert_id_after_insert example:
+
+```C++
+person p = {0, "test1", 2};  // id=0 表示让数据库自增
+// get_insert_id_after_insert 内部会执行 insert 并返回自增 ID
+auto id = mysql.get_insert_id_after_insert<person>(p);
+std::cout << "inserted id: " << id << std::endl;
+```
+
+注意：`get_insert_id_after_insert` 内部会执行 insert 操作并返回自增 ID，无需在外部先调用 `insert`。仅对含有自增主键的表有效。
+
+返回值：uint64_t，成功返回自增ID，失败返回0.
+
+11. 删除数据
 ```cpp
 template<typename T, typename... Args>
 int delete_records_s(const std::string &str = "", Args &&...args);
@@ -821,7 +914,7 @@ TEST_REQUIRE(sqlite.delete_records_s<person>("id=?", 1));
 
 返回值：bool，成功返回true，失败返回false.
 
-9. 查询数据
+12. 查询数据
 
 ```C++
 template<typename T, typename... Args>
@@ -852,7 +945,7 @@ auto result5 = sqlite.query_s<person>("id=?", 3);
 
 返回值：std::vector<T>，成功vector不为空，失败则为空.
 
-10. 特定列查询
+13. 特定列查询
 
 ```C++
 template<typename T, typename... Args>
@@ -909,7 +1002,7 @@ TEST_REQUIRE(r);
 
 返回值：int，成功返回更新数据的条数1，失败返回INT_MIN.
 
-12. 事务接口
+14. 事务接口
 
 开始事务，提交事务，回滚
 
@@ -927,7 +1020,7 @@ mysql.commit();
 ```
 返回值：bool，成功返回true，失败返回false.
 
-13. 面向切面编程AOP
+15. 面向切面编程AOP
 
 定义切面：
 
@@ -974,14 +1067,253 @@ auto r = mysql.warper_connect<log, validate>("127.0.0.1", "root", "12345", "test
 TEST_REQUIRE(r);
 ```
 
+## 高级特性
+
+### 可空字段 (std::optional)
+
+ormpp 支持 `std::optional<T>` 类型的字段，可优雅地处理数据库 NULL 值：
+
+```cpp
+struct person {
+  int id;
+  std::string name;
+  std::optional<int> age;  // age 可为 NULL
+};
+YLT_REFL(person, id, name, age);
+
+// 插入时 age 为 null
+person p1 = {1, "alice", {}};           // age = NULL
+person p2 = {2, "bob", 25};            // age = 25
+mysql.insert(p1);
+mysql.insert(p2);
+
+// 查询时自动还原 optional
+auto result = mysql.query_s<person>();
+for (auto& p : result) {
+  if (p.age.has_value()) {
+    std::cout << p.name << " age: " << *p.age << std::endl;
+  } else {
+    std::cout << p.name << " age: NULL" << std::endl;
+  }
+}
+```
+
+支持的可空类型：`std::optional<int>`, `std::optional<std::string>`, `std::optional<double>` 等。
+
+### 枚举类型映射
+
+ormpp 自动支持 C++ `enum` 和 `enum class` 与数据库整型字段的映射：
+
+```cpp
+enum class Color { BLUE = 10, RED = 15 };
+enum Fruit { APPLE, BANANA };
+
+struct test_enum_t {
+  Color color;
+  Fruit fruit;
+  int id;
+};
+YLT_REFL(test_enum_t, color, fruit, id);
+
+mysql.create_datatable<test_enum_t>(ormpp_auto_key{"id"});
+mysql.insert<test_enum_t>({Color::BLUE, APPLE, 0});
+
+auto vec = mysql.query<test_enum_t>();
+// vec[0].color == Color::BLUE
+// vec[0].fruit == APPLE
+```
+
+### 字段别名与表别名
+
+通过静态方法自定义数据库中的字段名和表名：
+
+```cpp
+struct person {
+  int id;
+  std::string name;
+  int age;
+
+  // 自定义字段别名（需与 YLT_REFL 注册顺序一致）
+  static constexpr auto get_alias_field_names(person *) {
+    return std::array{
+      ylt::reflection::field_alias_t{"person_id", 0},
+      ylt::reflection::field_alias_t{"person_name", 1},
+      ylt::reflection::field_alias_t{"person_age", 2}
+    };
+  }
+
+  // 自定义表名（默认使用结构体名 person）
+  static constexpr std::string_view get_alias_struct_name(person *) {
+    return "CUSTOM_TABLE_NAME";
+  }
+};
+YLT_REFL(person, id, name, age);
+```
+
+### 反射注册 (YLT_REFL)
+
+ormpp 基于 iguana 的编译期反射，需要在结构体定义后使用 `YLT_REFL` 宏注册字段：
+
+```cpp
+struct student {
+  int code;
+  std::string name;
+  int age;
+  std::optional<std::string> email;
+};
+
+// 注册所有字段（顺序决定数据库表中的列顺序）
+YLT_REFL(student, code, name, age, email);
+
+// 注册自增主键
+REGISTER_AUTO_KEY(student, code);
+
+// 注册冲突键（用于 replace / upsert）
+REGISTER_CONFLICT_KEY(student, name);
+```
+
+### 类型映射表
+
+ormpp 自动将 C++ 类型映射为对应数据库的 SQL 类型：
+
+| C++ 类型 | MySQL | PostgreSQL | SQLite |
+|---------|-------|-----------|--------|
+| `bool` | BOOLEAN | integer | INTEGER |
+| `char` | TINYINT | char | INTEGER |
+| `short` | SMALLINT | smallint | INTEGER |
+| `int` | INTEGER | integer | INTEGER |
+| `int64_t` | BIGINT | bigint | INTEGER |
+| `uint64_t` | BIGINT UNSIGNED | bigint | INTEGER |
+| `float` | FLOAT | real | FLOAT |
+| `double` | DOUBLE | double precision | DOUBLE |
+| `std::string` | TEXT | text | TEXT |
+| `std::string_view` | TEXT | text | TEXT |
+| `std::array<char, N>` | VARCHAR(N) | varchar(N) | VARCHAR(N) |
+| `blob` (std::vector<char>) | BLOB | bytea | BLOB |
+| `enum` / `enum class` | INTEGER | integer | INTEGER |
+| `std::optional<T>` | 同 T 类型 | 同 T 类型 | 同 T 类型 |
+
+## 连接池
+
+ormpp 内置了数据库连接池，支持自动创建、回收和健康检查，避免频繁创建/销毁连接带来的性能开销。
+
+### 基本用法
+
+```cpp
+#include "connection_pool.hpp"
+#include "mysql.hpp"
+
+// 初始化连接池（单例，全局只需初始化一次）
+// 参数：最大连接数, host, user, password, db, timeout, port
+ormpp::connection_pool<ormpp::mysql>::instance().init(
+    10, "127.0.0.1", "root", "12345", "testdb", 5, 3306);
+
+// 从连接池中获取连接（智能指针，超出作用域自动归还）
+auto conn = ormpp::connection_pool<ormpp::mysql>::instance().get();
+if (conn) {
+    conn->create_datatable<person>();
+    conn->insert(p);
+    auto result = conn->query_s<person>();
+    // conn 析构时自动归还到连接池
+}
+```
+
+### 连接池特性
+
+- **自动回收**：连接使用完毕后通过自定义 deleter 自动归还到池中
+- **超时等待**：获取连接时最多等待 3 秒，超时返回 `nullptr`
+- **健康检查**：自动检测连接是否存活（`ping`），失效连接会自动重建
+- **空闲超时**：连接空闲超过 8 小时会自动重建，避免数据库端超时断开
+- **线程安全**：连接池本身是线程安全的（`get()` / `init()` 内部使用 `std::mutex` 保护），但**从池中获取的单个连接对象不可跨线程并发使用**。如需多线程并发查询，每个线程应独立 `get()` 一个连接。
+
+## 异步 MySQL
+
+ormpp 支持基于 ASIO/async_simple 的异步 MySQL 查询，适合高并发场景。
+
+### 编译选项
+
+```bash
+cmake -B build -DENABLE_MYSQL_ASYNC=ON
+```
+
+### 基本用法
+
+```cpp
+#include "mysql_async.hpp"
+
+struct person {
+  int id;
+  std::string name;
+  int age;
+};
+YLT_REFL(person, id, name, age);
+
+ormpp::mysql_async async_mysql;
+// 异步连接
+co_await async_mysql.connect("127.0.0.1", "root", "12345", "testdb");
+
+// 异步查询
+auto result = co_await async_mysql.query_s<person>();
+for (auto& p : result) {
+    std::cout << p.name << std::endl;
+}
+
+// 异步插入
+person p{0, "tom", 20};  // id=0 表示自增
+int affected = co_await async_mysql.insert(p);
+```
+
+### 异步连接池
+
+```cpp
+#include "async_connection_pool.hpp"
+
+// 初始化异步连接池
+ormpp::async_connection_pool<ormpp::mysql_async>::instance().init(
+    10, "127.0.0.1", "root", "12345", "testdb");
+
+// 获取异步连接
+coro = []() -> async_simple::coro::Lazy<void> {
+    auto conn = co_await ormpp::async_connection_pool<ormpp::mysql_async>::instance().get();
+    auto result = co_await conn->query_s<person>();
+}();
+```
+
+注意：异步接口需要 C++20 协程支持，编译器要求 GCC 10+、Clang 13+ 或 MSVC 2019 16.8+。
+
+## 线程安全
+
+| 对象 | 线程安全性 | 说明 |
+|------|-----------|------|
+| `connection_pool` | ✅ 线程安全 | `init()`、`get()` 等操作内部使用 `std::mutex` 保护 |
+| 单个 `dbng` / 连接对象 | ❌ 非线程安全 | 不可跨线程共享同一个连接实例 |
+| `query` / `insert` / `update` | 依赖连接对象 | 底层调用数据库 C API，本身无额外锁保护 |
+
+**推荐做法**：每个工作线程通过 `connection_pool::get()` 独立获取连接，用完自动归还。严禁多个线程同时操作同一个连接对象。
+
 ## roadmap
 
-1. 支持组合键。
-1. 多表查询时增加一些诸如where, group, oder by, join, limit等常用的谓词，避免直接写sql语句。
-2. 增加日志
-3. 增加获取错误消息的接口
-4. 支持更多的数据库
-5. 增加数据库链接池
+1. ✅ 支持组合键（已通过链式调用 `primary_key(col1, col2)` 实现）
+2. ✅ 多表查询谓词（`where`, `group_by`, `having`, `order_by`, `join`, `limit`, `offset` 已支持）
+3. ✅ 日志支持（可通过 AOP 切面 `warper_connect<log>` 实现）
+4. ✅ 连接池（已实现，见[连接池](#连接池)）
+5. ✅ 异步 MySQL（已实现，见[异步 MySQL](#异步-mysql)）
+6. 🔄 增加获取错误消息的公开接口
+7. 🔄 支持更多的数据库（如 SQL Server、Oracle 等）
+8. 🔄 完善事务的嵌套支持
+9. 🔄 增加批量插入/更新的性能优化
+
+**历史版本**
+
+| 功能 | 版本 | 说明 |
+|------|------|------|
+| 链式查询 | v1.0+ | `select().from().where()` 类型安全构建器 |
+| 聚合查询 | v1.0+ | `count()`, `sum()`, `avg()`, `min()`, `max()` |
+| JOIN | v1.0+ | `inner_join()`, `left_join()` |
+| 连接池 | v1.0+ | 单例连接池，自动回收 |
+| 异步 MySQL | v1.0+ | ASIO/async_simple 协程支持 |
+| AOP 切面 | v1.0+ | `warper_connect` 日志/校验切面 |
+| 范围分区 | v1.0+ | MySQL/PostgreSQL/SQLite 统一分区 API |
 
 
 ## 联系方式
