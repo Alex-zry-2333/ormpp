@@ -31,4 +31,4 @@ jobs:
         working-directory: ${{ github.workspace }}/build/tests
         env:
           TSAN_OPTIONS: halt_on_error=1
-        run: ./test_ormpp -tc="issue #238*"
+        run: './test_ormpp -tc="issue #238*"'
