@@ -1,0 +1,34 @@
+name: CI-ThreadSanitizer
+
+on: [push, pull_request]
+
+jobs:
+  tsan-test:
+    name: TSan (Ubuntu, Debug)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++
+
+      - name: Configure cmake with ThreadSanitizer
+        run: >
+          cmake -B ${{ github.workspace }}/build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DENABLE_THREAD_SANITIZER=ON
+          -DENABLE_SANITIZER=OFF
+
+      - name: Build
+        run: cmake --build ${{ github.workspace }}/build --config Debug -j$(nproc)
+
+      - name: Test (thread-safety only)
+        working-directory: ${{ github.workspace }}/build
+        env:
+          CTEST_OUTPUT_ON_FAILURE: 1
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest -C Debug -j 1 -V -R "test_ormpp"

@@ -8,6 +8,7 @@
 #include "postgresql.hpp"
 #endif
 
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -4022,64 +4023,68 @@ struct thread_test_person {
 };
 REGISTER_AUTO_KEY(thread_test_person, id)
 
+// Dedicated type for the concurrent-first-query test.
+// Must NOT be queried in the main thread before the worker threads run,
+// otherwise get_fields<T>() cache would already be initialized.
+struct concurrent_first_query_person {
+  int id;
+  std::string name;
+  int age;
+};
+REGISTER_AUTO_KEY(concurrent_first_query_person, id)
+
 TEST_CASE("issue #238: multi-thread concurrent first query") {
-  // Use SQLite (no external DB needed) to test thread safety
-  dbng<sqlite> sqlite_db;
-  if (!sqlite_db.connect(":memory:")) {
-    // Skip if SQLite not available
-    return;
-  }
-
-  sqlite_db.execute("drop table if exists thread_test_person");
-  REQUIRE(sqlite_db.create_datatable<thread_test_person>(ormpp_auto_key{"id"}));
-
-  // Insert test data
-  for (int i = 1; i <= 10; ++i) {
-    thread_test_person p{0, "person_" + std::to_string(i), 20 + i};
-    REQUIRE(sqlite_db.insert(p) == 1);
-  }
-
-  // Verify data is there
-  auto all = sqlite_db.query<thread_test_person>();
-  REQUIRE(all.size() == 10);
-
-  // --- Test without init_reflection: concurrent first query ---
-  // Note: we use a fresh in-memory DB per thread to truly test
-  // the "first query" scenario for the same type T
+  // --- Part 1: concurrent first query on a type never touched before ---
   std::vector<std::thread> threads;
   std::atomic<int> success_count{0};
   std::atomic<int> fail_count{0};
+  std::atomic<bool> ready{false};
 
   for (int t = 0; t < 8; ++t) {
-    threads.emplace_back([&success_count, &fail_count, t]() {
-      try {
-        dbng<sqlite> db;
-        if (!db.connect(":memory:")) {
-          fail_count++;
-          return;
-        }
-        db.execute("drop table if exists thread_test_person");
-        db.create_datatable<thread_test_person>(ormpp_auto_key{"id"});
+    threads.emplace_back(
+        [&success_count, &fail_count, &ready, t]() {
+          try {
+            dbng<sqlite> db;
+            if (!db.connect(":memory:")) {
+              fail_count++;
+              return;
+            }
+            db.execute(
+                "drop table if exists concurrent_first_query_person");
+            db.create_datatable<concurrent_first_query_person>(
+                ormpp_auto_key{"id"});
 
-        for (int i = 1; i <= 5; ++i) {
-          thread_test_person p{
-              0, "t" + std::to_string(t) + "_p" + std::to_string(i), 20 + i};
-          db.insert(p);
-        }
+            for (int i = 1; i <= 5; ++i) {
+              concurrent_first_query_person p{
+                  0, "t" + std::to_string(t) + "_p" + std::to_string(i),
+                  20 + i};
+              db.insert(p);
+            }
 
-        // Concurrent first query on the same type from multiple threads
-        auto result = db.query<thread_test_person>();
-        if (result.size() == 5) {
-          success_count++;
-        }
-        else {
-          fail_count++;
-        }
-      } catch (...) {
-        fail_count++;
-      }
-    });
+            // Wait for the main thread to signal "go" so that all
+            // threads hit get_fields<T>() at roughly the same time.
+            while (!ready.load()) {
+              std::this_thread::yield();
+            }
+
+            // Concurrent first query on the same type from multiple threads
+            auto result = db.query_s<concurrent_first_query_person>();
+            if (result.size() == 5) {
+              success_count++;
+            }
+            else {
+              fail_count++;
+            }
+          }
+          catch (...) {
+            fail_count++;
+          }
+        });
   }
+
+  // Let workers finish setup, then release them all at once.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  ready.store(true);
 
   for (auto &th : threads) {
     th.join();
@@ -4088,14 +4093,15 @@ TEST_CASE("issue #238: multi-thread concurrent first query") {
   CHECK(fail_count == 0);
   CHECK(success_count == 8);
 
-  // --- Test with init_reflection: should also pass ---
+  // --- Part 2: pre-init reflection, then concurrent query ---
   ormpp::init_reflection<thread_test_person>();
 
   std::vector<std::thread> threads2;
   std::atomic<int> success_count2{0};
+  std::atomic<bool> ready2{false};
 
   for (int t = 0; t < 8; ++t) {
-    threads2.emplace_back([&success_count2, t]() {
+    threads2.emplace_back([&success_count2, &ready2, t]() {
       dbng<sqlite> db;
       if (!db.connect(":memory:"))
         return;
@@ -4107,12 +4113,19 @@ TEST_CASE("issue #238: multi-thread concurrent first query") {
         db.insert(p);
       }
 
-      auto result = db.query<thread_test_person>();
+      while (!ready2.load()) {
+        std::this_thread::yield();
+      }
+
+      auto result = db.query_s<thread_test_person>();
       if (result.size() == 3) {
         success_count2++;
       }
     });
   }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  ready2.store(true);
 
   for (auto &th : threads2) {
     th.join();
