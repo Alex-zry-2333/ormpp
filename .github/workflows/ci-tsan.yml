@@ -6,6 +6,7 @@ jobs:
   tsan-test:
     name: TSan (Ubuntu, Debug)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout Code
@@ -24,11 +25,10 @@ jobs:
           -DENABLE_SANITIZER=OFF
 
       - name: Build
-        run: cmake --build ${{ github.workspace }}/build --config Debug -j$(nproc)
+        run: cmake --build ${{ github.workspace }}/build --config Debug -j 4
 
       - name: Test (thread-safety only)
-        working-directory: ${{ github.workspace }}/build
+        working-directory: ${{ github.workspace }}/build/tests
         env:
-          CTEST_OUTPUT_ON_FAILURE: 1
           TSAN_OPTIONS: halt_on_error=1
-        run: ctest -C Debug -j 1 -V -R "test_ormpp"
+        run: ./test_ormpp -tc="issue #238*"

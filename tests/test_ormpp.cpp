@@ -4041,45 +4041,41 @@ TEST_CASE("issue #238: multi-thread concurrent first query") {
   std::atomic<bool> ready{false};
 
   for (int t = 0; t < 8; ++t) {
-    threads.emplace_back(
-        [&success_count, &fail_count, &ready, t]() {
-          try {
-            dbng<sqlite> db;
-            if (!db.connect(":memory:")) {
-              fail_count++;
-              return;
-            }
-            db.execute(
-                "drop table if exists concurrent_first_query_person");
-            db.create_datatable<concurrent_first_query_person>(
-                ormpp_auto_key{"id"});
+    threads.emplace_back([&success_count, &fail_count, &ready, t]() {
+      try {
+        dbng<sqlite> db;
+        if (!db.connect(":memory:")) {
+          fail_count++;
+          return;
+        }
+        db.execute("drop table if exists concurrent_first_query_person");
+        db.create_datatable<concurrent_first_query_person>(
+            ormpp_auto_key{"id"});
 
-            for (int i = 1; i <= 5; ++i) {
-              concurrent_first_query_person p{
-                  0, "t" + std::to_string(t) + "_p" + std::to_string(i),
-                  20 + i};
-              db.insert(p);
-            }
+        for (int i = 1; i <= 5; ++i) {
+          concurrent_first_query_person p{
+              0, "t" + std::to_string(t) + "_p" + std::to_string(i), 20 + i};
+          db.insert(p);
+        }
 
-            // Wait for the main thread to signal "go" so that all
-            // threads hit get_fields<T>() at roughly the same time.
-            while (!ready.load()) {
-              std::this_thread::yield();
-            }
+        // Wait for the main thread to signal "go" so that all
+        // threads hit get_fields<T>() at roughly the same time.
+        while (!ready.load()) {
+          std::this_thread::yield();
+        }
 
-            // Concurrent first query on the same type from multiple threads
-            auto result = db.query_s<concurrent_first_query_person>();
-            if (result.size() == 5) {
-              success_count++;
-            }
-            else {
-              fail_count++;
-            }
-          }
-          catch (...) {
-            fail_count++;
-          }
-        });
+        // Concurrent first query on the same type from multiple threads
+        auto result = db.query_s<concurrent_first_query_person>();
+        if (result.size() == 5) {
+          success_count++;
+        }
+        else {
+          fail_count++;
+        }
+      } catch (...) {
+        fail_count++;
+      }
+    });
   }
 
   // Let workers finish setup, then release them all at once.
